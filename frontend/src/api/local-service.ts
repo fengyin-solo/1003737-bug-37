@@ -1,6 +1,8 @@
+import { OWNED_MODULES, resolveAffiliation } from '@/data/affiliation'
 import { MODULE_BY_KEY } from '@/data/modules'
 import { allRows, listRows, resetRows, saveRows } from '@/data/local-store'
 import type { ActionResult, EntryRow, ModuleMeta, OverviewResult, PageResult } from '@/data/types'
+import { useSessionStore } from '@/stores/session'
 
 // 会写进数据的「往回走」动作：命中就把这条记录标成异常态，看板上能一眼看出来。
 const NEGATIVE_ACTIONS = ['撤销', '作废', '拒绝', '驳回', '停用', '忽略', '下线', '回滚']
@@ -40,10 +42,40 @@ export function runAction(key: string, id: number, action: string): ActionResult
     return { ok: false, message: `没有找到编号为 ${id} 的${meta.entity}` }
   }
   const current = String(rows[index].status)
+
+  // 以下校验全部通过之前不写库，任何一步失败都保持原样。
+
+  // 1. 会话校验：退出后 operator/unit 已清空，待办与历史结论保持原样，不能再动作。
+  const session = useSessionStore()
+  if (!session.canOperate) {
+    return { ok: false, message: '当前会话已退出，请重新登录后再执行动作' }
+  }
+
+  // 2. 归属校验：受控模块（巡检记录、遥测设备、通讯设备）顺着
+  //    「记录 → 站点 → 管理单位」链路核对当前值班单位。
+  if (OWNED_MODULES.includes(key)) {
+    const owner = resolveAffiliation(rows[index])
+    if (owner === null) {
+      // 历史无归属记录按约定只读：归属无法核实，谁都不能处置，先补登记归属再走流程。
+      return { ok: false, message: `该${meta.entity}是历史无归属记录，按约定只读，不能执行「${action}」` }
+    }
+    if (owner !== session.unit) {
+      return {
+        ok: false,
+        message: `越权拒绝：该${meta.entity}归属「${owner}」，当前值班单位「${session.unit}」无权「${action}」`,
+      }
+    }
+  }
+
+  // 3. 幂等校验：到达终态（如已处置）的记录不再接受任何动作，重复处置只生效一次，
+  //    旧结论留在记录里不被翻动。
+  const lastStatus = meta.statuses[meta.statuses.length - 1]
+  if (OWNED_MODULES.includes(key) && current === lastStatus) {
+    return { ok: false, message: `${meta.entity}已到达终态「${lastStatus}」，不能重复处置` }
+  }
   if (current === target) {
     return { ok: false, message: `${meta.entity}已经是「${target}」，不用重复操作` }
   }
-  const lastStatus = meta.statuses[meta.statuses.length - 1]
   const updated: EntryRow = {
     ...rows[index],
     status: target,
@@ -59,6 +91,14 @@ export function runAction(key: string, id: number, action: string): ActionResult
 export function resetModule(key: string): PageResult {
   resetRows(key)
   return listEntries(key)
+}
+
+// 登录可选的归属单位：取自监测站点的管理单位，跟着数据走，不另维护一份。
+export function knownUnits(): string[] {
+  const units = listRows('station')
+    .map((row) => String(row['管理单位'] ?? '').trim())
+    .filter((unit) => unit !== '')
+  return [...new Set(units)]
 }
 
 export function exportEntries(key: string): { filename: string; content: string } {
